@@ -1,6 +1,7 @@
 import * as dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
 import { initializeFirebase } from './config';
+import archiveRouter from './routes/archive';
 import { runScraper, scrapeSingleSource } from './scraper';
 
 dotenv.config();
@@ -10,6 +11,9 @@ initializeFirebase();
 
 const app = express();
 app.use(express.json());
+
+// استخدام موجهات الأرشيفة
+app.use('/api/archive', archiveRouter);
 
 const PORT = process.env.PORT || 8080;
 
