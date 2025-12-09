@@ -1,0 +1,45 @@
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+*.apk
+*.app
+*.ipa
+*.appbundle
+
+# Flutter web
+flutter_app/web/flutter_service_worker.js
+
+# Firebase
+.firebase/
+.firebaserc
+firebase-debug.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+/backend/functions/.env
+/backend/functions/.env.local
+firebase_service_account*.json

@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../features/articles/presentation/bloc/articles_bloc.dart';
 import '../../features/articles/presentation/pages/article_detail_page.dart';
 import '../../features/articles/presentation/pages/pdf_viewer_page.dart';
 import '../../features/auth/presentation/pages/login_page.dart';
@@ -11,7 +9,6 @@ import '../../features/favorites/presentation/pages/favorites_page.dart';
 import '../../features/home/presentation/pages/home_page.dart';
 import '../../features/search/presentation/pages/search_page.dart';
 import '../../features/settings/presentation/pages/settings_page.dart';
-import '../di/injection.dart';
 
 /// Application routing configuration
 class AppRouter {
@@ -47,10 +44,7 @@ class AppRouter {
       GoRoute(
         path: '/home',
         name: 'home',
-        builder: (context, state) => BlocProvider(
-          create: (context) => getIt<ArticlesBloc>(),
-          child: const HomePage(),
-        ),
+        builder: (context, state) => const HomePage(),
         routes: [
           // Article Detail
           GoRoute(
@@ -127,4 +121,11 @@ class AppRouter {
             const SizedBox(height: 24),
             ElevatedButton(
               onPressed: () => context.go('/home'),
-              child: const Text('العودة
+              child: const Text('العودة للرئيسية'),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
