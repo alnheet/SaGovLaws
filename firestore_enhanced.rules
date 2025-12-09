@@ -1,0 +1,141 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    function isOwnUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function canModifyArticles() {
+      return isAuthenticated() && 
+             (isAdmin() || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'editor');
+    }
+    
+    // ===== ARTICLES COLLECTION =====
+    match /articles/{articleId} {
+      // Read: Anyone can read published articles
+      allow read: if resource.data.published_at != null;
+      
+      // Create: Only admins/editors
+      allow create: if canModifyArticles() &&
+                      request.resource.data.title is string &&
+                      request.resource.data.source_key is string &&
+                      request.resource.data.category is string;
+      
+      // Update: Only admins can update
+      allow update: if isAdmin() &&
+                       request.resource.data.title is string &&
+                       request.resource.data.updated_at is timestamp;
+      
+      // Delete: Only admins
+      allow delete: if isAdmin();
+    }
+    
+    // ===== SOURCES COLLECTION =====
+    match /sources/{sourceId} {
+      // Read: Anyone can read sources
+      allow read: if true;
+      
+      // Write: Only admins
+      allow write: if isAdmin() &&
+                      request.resource.data.name_ar is string &&
+                      request.resource.data.cat_id is number;
+    }
+    
+    // ===== USERS COLLECTION =====
+    match /users/{userId} {
+      // Read: Users can read their own profile
+      allow read: if isOwnUser(userId) || isAdmin();
+      
+      // Create: On signup
+      allow create: if request.auth.uid == userId &&
+                       request.resource.data.email == request.auth.token.email;
+      
+      // Update: Users can update their own profile
+      allow update: if isOwnUser(userId) &&
+                       request.resource.data.email == resource.data.email;
+      
+      // Delete: Only admins
+      allow delete: if isAdmin();
+      
+      // ===== FAVORITES SUBCOLLECTION =====
+      match /favorites/{favoriteId} {
+        // Read: User can read their favorites
+        allow read: if isOwnUser(userId);
+        
+        // Create: User can add to favorites
+        allow create: if isOwnUser(userId) &&
+                        request.resource.data.article_id is string &&
+                        request.resource.data.added_at is timestamp;
+        
+        // Delete: User can remove from favorites
+        allow delete: if isOwnUser(userId);
+      }
+      
+      // ===== NOTIFICATION PREFERENCES SUBCOLLECTION =====
+      match /notification_preferences/{prefId} {
+        // Read: User can read their preferences
+        allow read: if isOwnUser(userId);
+        
+        // Write: User can update their preferences
+        allow write: if isOwnUser(userId);
+      }
+    }
+    
+    // ===== SEARCH HISTORY (Personal) =====
+    match /users/{userId}/search_history/{queryId} {
+      allow read: if isOwnUser(userId);
+      allow create: if isOwnUser(userId) &&
+                       request.resource.data.query is string &&
+                       request.resource.data.searched_at is timestamp;
+      allow delete: if isOwnUser(userId);
+    }
+    
+    // ===== ADMIN COLLECTIONS =====
+    
+    // Notification Events (for analytics)
+    match /notification_events/{eventId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // FCM Tokens Cleanup Queue
+    match /fcm_tokens_cleanup/{token} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // Audit Logs
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // ===== ANALYTICS & STATISTICS =====
+    match /analytics/{document=**} {
+      // Read: Only admins
+      allow read: if isAdmin();
+      // Write: Cloud Functions only
+      allow write: if request.auth == null && 
+                      request.auth.token.iss == 'https://securetoken.google.com/sagovlaws';
+    }
+    
+    // ===== CATCH-ALL (DENY BY DEFAULT) =====
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
