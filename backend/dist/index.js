@@ -39,12 +39,15 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const dotenv = __importStar(require("dotenv"));
 const express_1 = __importDefault(require("express"));
 const config_1 = require("./config");
+const archive_1 = __importDefault(require("./routes/archive"));
 const scraper_1 = require("./scraper");
 dotenv.config();
 // Initialize Firebase
 (0, config_1.initializeFirebase)();
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
+// استخدام موجهات الأرشيفة
+app.use('/api/archive', archive_1.default);
 const PORT = process.env.PORT || 8080;
 /**
  * Health check endpoint
