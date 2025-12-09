@@ -1,0 +1,655 @@
+**TLDR**
+
+* You will build **“Rasid UQN”**: a multi-source Flutter news app that tracks **7 official categories** from the Umm Al-Qura Gazette (uqn.gov.sa).
+* Backend is **serverless and cost-optimized**:
+
+  * **Cloud Run + Puppeteer + Cheerio** for robust scraping when no public API is available.
+  * **(If possible)** lighter HTML/API ingestion path first; Puppeteer kept as a fallback for resilience.
+  * **Firestore** for storage, **Firebase Auth** for login, **FCM + Local Notifications** for alerts.
+* Client: Flutter app with **RTL UI**, tabs per source, “All”, “Favorites”, search, PDF viewing, share, export to image/PDF, offline cache.
+* Architecture separates concerns clearly: **Scraping service → Firestore → Notification service → Flutter UI**, with a flexible data model that supports more sources later.
+
+---
+
+## Steps
+
+### 1. Product Overview
+
+**Product name:** `Rasid UQN`
+**Goal:** Provide a single mobile app where users can track and read official decisions, royal orders, regulations and related categories from **Umm Al-Qura Gazette**, with:
+
+* Multi-source tracking (7 defined categories, easily extendable)
+* Clean Arabic RTL reading experience
+* Favorites, sharing, exporting articles
+* Smart, low-cost notifications about new content
+
+**Primary users:**
+
+* Legal / regulatory staff
+* Government employees
+* Researchers and journalists
+* Interested citizens following official decisions
+
+---
+
+### 2. Target Sources & Configuration
+
+**Initial 7 categories**:
+
+| Category (Arabic)   | Category (English)      | cat ID | source_key              |
+| ------------------- | ----------------------- | ------ | ----------------------- |
+| قرارات مجلس الوزراء | Cabinet Decisions       | 9      | `cabinet_decisions`     |
+| أوامر ملكية         | Royal Orders            | 7      | `royal_orders`          |
+| مراسيم ملكية        | Royal Decrees           | 8      | `royal_decrees`         |
+| قرارات وأنظمة       | Decisions & Regulations | 6      | `decisions_regulations` |
+| لوائح وأنظمة        | Laws & Regulations      | 11     | `laws_regulations`      |
+| قرارات وزارية       | Ministerial Decisions   | 10     | `ministerial_decisions` |
+| هيئات               | Authorities             | 12     | `authorities`           |
+
+**Source configuration storage:**
+
+* Keep a **`sources`** collection in Firestore (canonical data for app logic).
+* Mirror essential configuration (e.g. which sources are enabled, display order) in **Firebase Remote Config** to:
+
+  * Toggle categories on/off
+  * Change labels or colors
+  * Adjust scraper behavior (e.g. maximum pages per run) without redeploying code.
+
+**Source model fields:**
+
+* `id` (string): `cabinet_decisions`, `royal_orders`, …
+* `name_ar`, `name_en`
+* `cat_id` (number)
+* `url` (string, e.g. `https://uqn.gov.sa/category?cat=9`)
+* `enabled` (boolean)
+* `icon` (Material icon name)
+* `color` (hex color)
+* `order` (for tab ordering)
+* `last_sync_at`, `article_count`, `last_error` (monitoring)
+
+---
+
+### 3. System Architecture
+
+High-level architecture:
+
+```text
+┌─────────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
+│ Cloud Scheduler │────▶│  Cloud Run Scraper       │────▶│    Firestore    │
+│ (hourly/daily)  │     │ (Node.js, Puppeteer,     │     │ - articles      │
+│                 │     │  Cheerio, Axios)         │     │ - sources       │
+└─────────────────┘     └──────────────────────────┘     │ - users         │
+                                                         └──────┬──────────┘
+                                                                │
+                                              Firestore Trigger │
+                                                          ┌─────▼─────────┐
+                                                          │ Cloud Function│
+                                                          │  (FCM Push)   │
+                                                          └─────┬─────────┘
+                                                                │ Data Messages
+                                                     ┌──────────▼──────────┐
+                                                     │   Flutter App       │
+                                                     │ - Auth / Firestore  │
+                                                     │ - Offline Cache     │
+                                                     │ - Local Notifications│
+                                                     └─────────────────────┘
+```
+
+**Key design decisions:**
+
+* **Cloud Run** for scraping:
+
+  * Needed because WordPress REST API is disabled and DOM is loaded dynamically.
+  * Can run Puppeteer/Chromium reliably with higher timeout and memory (up to 60 minutes).
+  * Container can be optimized and scaled to zero when idle (cost-effective).
+* **Firestore** as primary data store:
+
+  * `articles`, `sources`, `users`, `favorites`.
+* **Firebase Functions** for:
+
+  * Firestore triggers on new articles.
+  * Sending FCM data messages (silent push).
+* **Flutter** client:
+
+  * Consumes Firestore data.
+  * Uses FCM + `flutter_local_notifications` for local scheduling.
+  * Manages offline cache (Hive/SQLite/Drift).
+
+---
+
+### 4. Scraping & Ingestion Strategy
+
+#### 4.1 General principles
+
+1. **Try lightweight ingestion first**:
+
+   * Inspect the browser Network tab for each category.
+   * If there is an internal JSON or HTML endpoint that lists posts per category (`?ajax=1`, `load_more`, etc.), use **Axios + Cheerio** only.
+   * This keeps Cloud Run execution cheap and simple.
+
+2. **Fallback to Puppeteer if no endpoint is available or stable**:
+
+   * Use headless Chromium in Cloud Run.
+   * Navigate to each category URL.
+   * Programmatically click “المزيد…” (“Load more”) until:
+
+     * Reaching the end of list, or
+     * A known existing `article_id` is encountered (Incremental mode).
+
+3. **Sync modes**:
+
+| Mode            | When used                      | Behavior                                                 |
+| --------------- | ------------------------------ | -------------------------------------------------------- |
+| **Full Sync**   | First boot / manual admin call | Load all pages for all sources until no new articles.    |
+| **Incremental** | Scheduled hourly/daily sync    | Load newest pages only; stop when encountering known ID. |
+
+4. **Rate limiting & politeness**:
+
+   * 2–3 seconds delay between page interactions.
+   * Use exponential backoff for HTTP errors.
+   * Log soft failures for retry on next schedule.
+
+#### 4.2 Unique article ID scheme
+
+* Extract the **original ID** from detail URL, e.g.:
+  `https://uqn.gov.sa/?p=28661` or `/details?p=28661` → `original_id = "28661"`.
+* Build canonical `id` as:
+  `"{source_key}_{original_id}"` → e.g. `"cabinet_decisions_28661"`
+* This ensures uniqueness **across** sources and is stable even if list page changes.
+
+#### 4.3 Cloud Run job flow (per execution)
+
+1. Read active sources from Firestore or Remote Config.
+
+2. For each source (or subset according to schedule rotation):
+
+   * Build category URL (`https://uqn.gov.sa/category?cat={cat_id}`).
+   * Use **lightweight endpoint** if available, otherwise Puppeteer.
+   * Collect all articles on the first page; follow “Load more” until:
+
+     * No more results or
+     * Encounter existing IDs (incremental stop condition).
+   * For each article:
+
+     * Extract: title, Hijri date, Gregorian date if available, detail URL, any direct PDF link.
+     * Optionally request the detail page to extract `content_html` and `pdf_url` if not present on the list.
+
+3. **Upsert** into Firestore:
+
+   * If `articles/{id}` does not exist: create document.
+   * If exists: update changed fields only (title/ dates / pdf_ref).
+
+4. Update `sources/{id}.last_sync_at`, `article_count`, and `last_error` accordingly.
+
+---
+
+### 5. Data Model (Firestore)
+
+#### 5.1 `sources` collection
+
+```ts
+interface SourceDoc {
+  id: string;                // "cabinet_decisions"
+  name_ar: string;           // "قرارات مجلس الوزراء"
+  name_en: string;           // "Cabinet Decisions"
+  cat_id: number;            // 9
+  url: string;               // category URL
+  enabled: boolean;
+  icon: string;              // e.g. "gavel"
+  color: string;             // "#1976D2"
+  order: number;             // display order in tabs
+  last_sync_at?: FirebaseTimestamp;
+  article_count?: number;
+  last_error?: string | null;
+}
+```
+
+#### 5.2 `articles` collection
+
+```ts
+interface ArticleDoc {
+  id: string;                    // "cabinet_decisions_28661"
+  original_id: string;           // "28661"
+  source_key: string;            // "cabinet_decisions"
+  source_name_ar: string;
+  cat_id: number;
+
+  // Core content
+  title: string;
+  content_html?: string | null;  // full HTML from detail page
+  content_plain?: string | null; // stripped text, optimized for search
+  excerpt?: string | null;       // first 200 chars
+
+  // Dates
+  publish_date_raw: string;      // as shown (Hijri or combined)
+  publish_date_gregorian?: string | null; // "2025-11-28" if parsed
+  publish_date_iso?: FirebaseTimestamp;   // normalized timestamp for sorting
+
+  // URLs & attachments
+  url: string;                   // detail page
+  pdf_url?: string | null;       // direct PDF (if available)
+  pdf_storage_path?: string | null; // optional, when mirrored to Storage
+  has_pdf: boolean;
+
+  // Meta
+  scraped_at: FirebaseTimestamp;
+  updated_at: FirebaseTimestamp;
+
+  tags?: string[];
+  related_archive_id?: string | null;
+}
+```
+
+#### 5.3 `users` collection
+
+```ts
+interface UserDoc {
+  uid: string;                   // Firebase Auth UID
+  email?: string | null;
+  display_name?: string | null;
+
+  // Notification preferences
+  notification_enabled: boolean;
+  // if using server-side grouping:
+  notification_hours?: number[]; // e.g. [8, 14, 20]
+  // if using local scheduling:
+  // exact times can live on device; we may store a shadow copy here.
+
+  subscribed_sources: string[];  // ["cabinet_decisions", "royal_orders"] or ["all"]
+
+  // UI settings
+  theme: "light" | "dark" | "system";
+  font_size: "small" | "medium" | "large";
+
+  // Device & meta
+  fcm_tokens: string[];          // tokens for user’s devices
+  created_at: FirebaseTimestamp;
+  updated_at: FirebaseTimestamp;
+  last_seen_at?: FirebaseTimestamp;
+}
+```
+
+#### 5.4 `users/{uid}/favorites` subcollection
+
+```ts
+interface FavoriteDoc {
+  article_id: string;            // "cabinet_decisions_28661"
+  source_key: string;
+  added_at: FirebaseTimestamp;
+}
+```
+
+---
+
+### 6. Notification System (FCM + Local Notifications)
+
+**Primary design (recommended): Silent Push + Local Notifications**
+
+**Server side:**
+
+1. A Firestore trigger listens on `articles` collection for new documents.
+
+2. When a new article is added, Cloud Function:
+
+   * Computes high-level summary (e.g. count of new articles since last run per source).
+   * Sends a **data-only FCM message** to topic `"news_updates"` with payload:
+
+   ```json
+   {
+     "type": "articles_update",
+     "source_keys": ["cabinet_decisions", "royal_orders"],
+     "new_count": 5,
+     "timestamp": 1730928000
+   }
+   ```
+
+3. No need to read all users each time; topic routing is handled by FCM.
+
+**Client side (Flutter app):**
+
+1. On login / first run, app subscribes each device to topic `"news_updates"` (and optionally per-source topics like `"news_cabinet_decisions"`).
+
+2. The app implements `onBackgroundMessage`:
+
+   * When it receives a data message, it:
+
+     * Checks user’s **subscribed_sources** (local or from Firestore).
+     * Fetches new articles only if necessary (e.g. last N articles per subscribed source).
+     * Schedules **local notifications** at user-selected times (up to 3 daily) using `flutter_local_notifications`.
+
+3. Notification times are stored **locally** for precision. Optionally, a copy is stored in Firestore for backup.
+
+**Advantages:**
+
+* Server load is independent of number of users.
+* Firestore reads per user are avoided in the push workflow.
+* Users have precise control over notification timing in their local time zone.
+
+**Alternative (if server-side control of time is mandatory):**
+
+* Store `notification_hours: number[]` in UserDoc.
+
+* Cloud Scheduler runs hourly.
+
+* Cloud Function queries:
+
+  ```pseudo
+  users where notification_hours array contains currentHour
+  ```
+
+* Sends FCM notification only to those users.
+
+* This is more expensive than the topic + local schedule approach but still manageable with indexes.
+
+---
+
+### 7. Mobile App (Flutter) – Architecture & UI
+
+#### 7.1 App architecture
+
+* **Framework:** Flutter 3+
+
+* **State management:** Bloc or Riverpod (recommended for testability)
+
+* **Layers (Clean Architecture style):**
+
+  * `data`: Firestore/Storage/FCM/Hive implementations
+  * `domain`: use cases (load articles, mark favorite, search, etc.)
+  * `presentation`: blocs/providers + widgets
+
+* **Offline support:**
+
+  * Cache articles locally (e.g. using Hive or Drift) for offline reading.
+  * Keep “last N articles per source” in local storage.
+  * Sync delta when network is back (using last known timestamps).
+
+#### 7.2 Navigation & screens
+
+Structure:
+
+```text
+Root
+ ├─ Authentication flow (Firebase Auth)
+ └─ Main Shell
+     ├─ Home (Tabbed)
+     │   ├─ Tab: "All"
+     │   ├─ Tab: "Cabinet Decisions"
+     │   ├─ Tab: "Royal Orders"
+     │   ├─ ... (7 source tabs)
+     │   └─ Tab: "Favorites"
+     ├─ Article Detail Screen
+     ├─ Search Screen
+     ├─ Settings Screen
+     └─ About / Help Screen
+```
+
+**Home tabs:**
+
+* “All”: shows latest articles across all enabled sources (sorted by `publish_date_iso` desc).
+* Per-source tabs: filter by `source_key`.
+* “Favorites”: reads from `users/{uid}/favorites`.
+
+**Article Card:**
+
+* Title (bold, RTL, right-aligned).
+* Excerpt (150–200 chars).
+* Date (Hijri + Gregorian if available).
+* Source chip (e.g. “قرارات مجلس الوزراء”).
+* PDF icon if `has_pdf = true`.
+* Star button (toggle favorite).
+
+**Article Detail:**
+
+* Full title.
+* Hijri + Gregorian dates.
+* Render `content_html` in an in-app HTML widget (with RTL) or show `content_plain`.
+* Buttons:
+
+  * Open PDF (if present) in in-app PDF viewer.
+  * Favorite/unfavorite.
+  * Share (title + URL).
+  * Export to image or PDF (share/save locally).
+
+**Settings:**
+
+* Notification on/off.
+* Up to three daily times (TimePickers) for local notifications.
+* Source subscriptions (checkbox list for 7 sources).
+* Theme: Light / Dark / System.
+* Font size slider or discrete sizes.
+* Cache management: clear local cache.
+
+**RTL & design:**
+
+* Global `textDirection: TextDirection.rtl`.
+* Use Arabic-friendly fonts (e.g. Tajawal, Cairo, Noto Sans Arabic).
+* Right alignment in all main text blocks.
+* Mirror UI icons where applicable.
+
+---
+
+### 8. PDF Handling Strategy
+
+**MVP:**
+
+* Use `pdf_url` only.
+* Open PDF directly from remote URL inside the app:
+
+  * Use `syncfusion_flutter_pdfviewer` or `flutter_pdfview`.
+* If `pdf_url` is missing, rely on the article content only.
+
+**Future enhancement:**
+
+* Cloud Run or Cloud Function detects new `pdf_url` values and:
+
+  * Downloads the file.
+  * Stores it in Firebase Storage (e.g. `/pdfs/{source_key}/{article_id}.pdf`).
+  * Updates `articles/{id}.pdf_storage_path` or `pdf_download_url`.
+* This preserves PDFs even if removed from the original site.
+
+---
+
+### 9. Security, Auth & Permissions
+
+* **Authentication:**
+
+  * Firebase Auth (email/password, possibly phone auth later).
+  * Each user’s favorites, notification settings, and FCM tokens are scoped by UID.
+
+* **Firestore rules:**
+
+  * Allow **read** to `articles` and `sources` for all authenticated users (these are public decisions).
+  * Restrict write operations on `articles` and `sources` to service accounts / Cloud Run only.
+  * For `users/{uid}`, `favorites`, and personal settings:
+
+    * Allow read/write only if `request.auth.uid == uid`.
+
+* **Cloud Run:**
+
+  * Ingress restricted (preferably internal) and triggered by Cloud Scheduler or a signed URL.
+  * No public scraping endpoint exposed to end-users.
+
+---
+
+### 10. Implementation Roadmap
+
+**Phase 1 – Backend foundation:**
+
+1. Create Firebase project, enable:
+
+   * Firestore, Auth, FCM, Remote Config.
+2. Design Firestore collections & indexes (`articles`, `sources`).
+3. Build Cloud Run scraper:
+
+   * Node.js + Puppeteer + Cheerio.
+   * Implement full + incremental sync logic for **one** category first (e.g. `cabinet_decisions`).
+4. Integrate Cloud Scheduler to trigger Cloud Run hourly/daily.
+5. Add Firestore trigger in Cloud Functions to push data messages on new articles.
+
+**Phase 2 – Flutter core app:**
+
+1. Setup Flutter project structure & routing.
+2. Integrate Firebase Auth, Firestore and FCM.
+3. Implement:
+
+   * Home screen with tabs (All + one source + Favorites).
+   * Article list + detail view.
+   * Favorites.
+4. Add basic local cache and Offline mode.
+
+**Phase 3 – Multi-source expansion & notifications:**
+
+1. Extend to all 7 categories (sources).
+2. Add per-source tabs and filtering.
+3. Implement subscription per source (user chooses which ones).
+4. Implement FCM data handling + local notification scheduling.
+
+**Phase 4 – Advanced features & polish:**
+
+1. Search screen (by title & content_plain).
+2. Export article to image/PDF.
+3. PDF in-app view.
+4. Settings: theme, font size, advanced notifications.
+5. About + basic analytics (Firebase Analytics).
+
+---
+
+### Code (selected skeletons)
+
+#### 1) TypeScript article interface
+
+```ts
+// shared/interfaces/article.ts
+export interface ArticleDoc {
+  id: string;
+  original_id: string;
+  source_key: string;
+  source_name_ar: string;
+  cat_id: number;
+
+  title: string;
+  content_html?: string | null;
+  content_plain?: string | null;
+  excerpt?: string | null;
+
+  publish_date_raw: string;
+  publish_date_gregorian?: string | null;
+  publish_date_iso?: FirebaseFirestore.Timestamp;
+
+  url: string;
+  pdf_url?: string | null;
+  pdf_storage_path?: string | null;
+  has_pdf: boolean;
+
+  scraped_at: FirebaseFirestore.Timestamp;
+  updated_at: FirebaseFirestore.Timestamp;
+
+  tags?: string[];
+  related_archive_id?: string | null;
+}
+```
+
+#### 2) Cloud Run scraper main (high-level pseudocode)
+
+```ts
+import puppeteer from "puppeteer";
+import * as admin from "firebase-admin";
+import { ArticleDoc } from "./interfaces/article";
+
+admin.initializeApp();
+const db = admin.firestore();
+
+async function scrapeCategory(source: SourceDoc, mode: "full" | "incremental") {
+  const browser = await puppeteer.launch({ args: ["--no-sandbox"] });
+  const page = await browser.newPage();
+
+  await page.goto(source.url, { waitUntil: "networkidle2", timeout: 60000 });
+
+  const collected: ArticleDoc[] = [];
+
+  let hasMore = true;
+  while (hasMore) {
+    const html = await page.content();
+    const newArticles = parseArticlesFromHtml(html, source);
+    collected.push(...newArticles);
+
+    if (mode === "incremental" && hasExistingIds(newArticles)) {
+      hasMore = false;
+      break;
+    }
+
+    const loadMoreExists = await clickLoadMoreIfExists(page);
+    if (!loadMoreExists) hasMore = false;
+
+    await delay(2000);
+  }
+
+  await browser.close();
+  await upsertArticles(collected, source);
+}
+
+export async function main() {
+  const sourcesSnapshot = await db.collection("sources")
+    .where("enabled", "==", true)
+    .orderBy("order")
+    .get();
+
+  const sources = sourcesSnapshot.docs.map(d => d.data() as SourceDoc);
+
+  // Example: incremental sync for all enabled sources
+  for (const source of sources) {
+    await scrapeCategory(source, "incremental");
+  }
+}
+```
+
+*(Implementation details for `parseArticlesFromHtml`, `hasExistingIds`, `clickLoadMoreIfExists`, and `upsertArticles` are environment-specific and would be refined after inspecting the site’s DOM and network patterns.)*
+
+---
+
+### Validation
+
+To validate the integrated plan and implementation:
+
+1. **Scraping correctness**
+
+   * Manually pick a date range and verify that all articles on the website appear in Firestore for each category.
+   * Check that duplicate runs do **not** create duplicate documents (document IDs remain stable).
+
+2. **Multi-source integrity**
+
+   * Confirm that tabs show correct counts per source.
+   * Confirm that “All” tab correctly merges and sorts across all sources by `publish_date_iso`.
+
+3. **Notification behavior**
+
+   * Test FCM data messages on real devices:
+
+     * New articles trigger a background handler.
+     * Local notifications appear at the configured times.
+   * Measure Firestore read counts to ensure they stay low (no per-user polling on backend).
+
+4. **UI/UX**
+
+   * RTL alignment on different screen sizes.
+   * Arabic text rendering quality and line breaking across screens.
+   * Smooth scrolling and loading for lists with hundreds/thousands of items.
+
+5. **Offline**
+
+   * Put device in airplane mode after initial sync.
+   * Confirm that cached articles can still be browsed and that favorites remain accessible.
+
+6. **Performance and cost**
+
+   * Monitor Cloud Run execution time and memory usage over several days.
+   * Monitor Firestore read/write ops to ensure they align with budget.
+   * Adjust Scheduler frequency and sync strategy if costs are higher than expected.
+
+---
+
+**Self-Critique**
+
+* The plan assumes Cloud Run + Puppeteer as a reliable way to load all dynamic content. If the site’s anti-bot protections increase, you might need additional measures (user-agent rotation, stronger backoff, or coordination with the site owner).
+* Notification strategy focuses on cost optimization (topics + local scheduling). For some strict compliance or SLA scenarios, server-side, per-user time slots might be required, which increases complexity and Firestore reads.
+* Full-text search is not deeply specified; for large volumes and advanced search needs, integrating Algolia/Typesense or similar would be preferable to Firestore text queries.

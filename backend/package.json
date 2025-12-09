@@ -1,0 +1,31 @@
+{
+    "name": "rasid-uqn-backend",
+    "version": "1.0.0",
+    "description": "Backend scraper and functions for Rasid UQN - Umm Al-Qura Gazette News App",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dev": "ts-node src/index.ts",
+        "scrape": "ts-node src/scraper/index.ts",
+        "deploy:scraper": "gcloud run deploy rasid-scraper --source ./scraper --region=me-west1",
+        "deploy:functions": "cd functions && npm run deploy"
+    },
+    "dependencies": {
+        "axios": "^1.6.2",
+        "cheerio": "^1.0.0-rc.12",
+        "firebase-admin": "^12.0.0",
+        "puppeteer": "^21.6.1",
+        "express": "^4.18.2",
+        "dotenv": "^16.3.1"
+    },
+    "devDependencies": {
+        "@types/express": "^4.17.21",
+        "@types/node": "^20.10.4",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.3.3"
+    },
+    "engines": {
+        "node": ">=18"
+    }
+}

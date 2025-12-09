@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Articles collection - public read
+    match /articles/{articleId} {
+      allow read: if true;
+      allow write: if false; // Only backend can write
+    }
+    
+    // Sources collection - public read
+    match /sources/{sourceId} {
+      allow read: if true;
+      allow write: if false; // Only backend can write
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId);
+      allow delete: if false;
+      
+      // Favorites subcollection
+      match /favorites/{favoriteId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId);
+      }
+    }
+  }
+}
