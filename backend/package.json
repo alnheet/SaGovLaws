@@ -13,6 +13,7 @@
         "seed:dist": "node dist/seed-database.js",
         "scrape:real": "ts-node src/scrape-real-data.ts",
         "scrape:uqn": "ts-node src/scrape-uqn.ts",
+        "scrape:uqn2": "ts-node src/scrape-uqn-v2.ts",
         "deploy:scraper": "gcloud run deploy rasid-scraper --source ./scraper --region=me-west1",
         "deploy:functions": "cd functions && npm run deploy"
     },
