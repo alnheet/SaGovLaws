@@ -8,6 +8,11 @@
         "start": "node dist/index.js",
         "dev": "ts-node src/index.ts",
         "scrape": "ts-node src/scraper/index.ts",
+        "seed": "ts-node src/seed-database.ts",
+        "seed:simple": "ts-node src/seed-simple.ts",
+        "seed:dist": "node dist/seed-database.js",
+        "scrape:real": "ts-node src/scrape-real-data.ts",
+        "scrape:uqn": "ts-node src/scrape-uqn.ts",
         "deploy:scraper": "gcloud run deploy rasid-scraper --source ./scraper --region=me-west1",
         "deploy:functions": "cd functions && npm run deploy"
     },

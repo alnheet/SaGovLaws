@@ -43,3 +43,4 @@ Thumbs.db
 /backend/functions/.env
 /backend/functions/.env.local
 firebase_service_account*.json
+backend/firebase-service-account.json
